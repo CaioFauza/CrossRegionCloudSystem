@@ -7,37 +7,23 @@ session = credentials.get_credentials()
 ec2_east2 = boto3.client('ec2', region_name='us-east-2')  # Ohio
 rds = boto3.client('rds', region_name='us-east-2')  # Ohio
 ec2_east1 = boto3.resource('ec2', region_name='us-east-1')  # North Virginia
-ec2_east1_client = boto3.client('ec2', region_name='us-east-1')
-lb = boto3.client('elbv2', region_name='us-east-1')
-auto_scaling = boto3.client('autoscaling', region_name='us-east-1')
+ec2_east1_client = boto3.client('ec2', region_name='us-east-1')  # North Virginia
+lb = boto3.client('elbv2', region_name='us-east-1') # North Virginia
+auto_scaling = boto3.client('autoscaling', region_name='us-east-1') # North Virginia
 
 # ======================================== Destroy ========================================================
 try:  
-    # db region destroy
+    #db region destroy
     rds.delete_db_instance(DBInstanceIdentifier='caio-project', SkipFinalSnapshot=True, DeleteAutomatedBackups=True)
     print("Waiting for rds elimination. Please wait, could take up to 5 minutes...")
     rds_waiter = rds.get_waiter('db_instance_deleted')
     rds_waiter.wait(DBInstanceIdentifier='caio-project')
     ec2_east2.delete_security_group(GroupName='caio-project-db-sg')
     
-    
     print("RDS deleted.")
 
     # webserver region destroy
     print("Waiting for webserver elimination....")
-    auto_scaling.delete_auto_scaling_group(AutoScalingGroupName='project-caio-ASG', ForceDelete=True)
-    lb_destroy = lb.describe_load_balancers(
-        Names=['project-caio-elb']
-    )
-    lb.delete_load_balancer(LoadBalancerArn=lb_destroy['LoadBalancers'][0]['LoadBalancerArn'])
-    lb_waiter = lb.get_waiter('load_balancers_deleted')
-    lb_waiter.wait(Names=['project-caio-elb'])
-
-    tg_destroy = lb.describe_target_groups(Names=['project-caio-tg'])
-    lb.delete_target_group(TargetGroupArn=tg_destroy['TargetGroups'][0]['TargetGroupArn'])
-
-    auto_scaling.delete_launch_configuration(LaunchConfigurationName='project-caio-lc-webserver')
-
     image_info = ec2_east1_client.describe_images(Filters=[
         {
             'Name': 'description',
@@ -46,9 +32,39 @@ try:
             ]
         }
     ])
+
+    auto_scaling.delete_auto_scaling_group(AutoScalingGroupName='project-caio-ASG', ForceDelete=True)
+    lb_destroy = lb.describe_load_balancers(
+        Names=['project-caio-elb']
+    )
+
+    listener_destroy = lb.describe_listeners(LoadBalancerArn=lb_destroy['LoadBalancers'][0]['LoadBalancerArn'])
+    lb.delete_listener(ListenerArn= listener_destroy["Listeners"][0]["ListenerArn"])
+    print("ELB Listener eliminated.")
     
+    lb.delete_load_balancer(LoadBalancerArn=lb_destroy['LoadBalancers'][0]['LoadBalancerArn'])
+    print("Waiting for load balancer elimination...")
+    lb_waiter = lb.get_waiter('load_balancers_deleted')
+    lb_waiter.wait(Names=['project-caio-elb'])
+    print("Load balancer deleted.")
+
+    tg_destroy = lb.describe_target_groups(Names=['project-caio-tg'])
+    lb.delete_target_group(TargetGroupArn=tg_destroy['TargetGroups'][0]['TargetGroupArn'])
+    print("Target Group eliminated.")
+
     ec2_east1_client.deregister_image(ImageId=image_info['Images'][0]['ImageId'])
-    ec2_east1_client.delete_security_group(GroupName='caio-project-wb-sg')
+    print("Imaged deregistered.")
+
+    lc_delete = auto_scaling.delete_launch_configuration(LaunchConfigurationName='project-caio-lc-webserver')
+    print("Launch configuration deleted.")
+
+    while 1:
+        try:
+            time.sleep(2)
+            ec2_east1_client.delete_security_group(GroupName='caio-project-wb-sg')
+            break
+        except:
+            pass
     print("Webserver deleted.")
 except:
     pass
@@ -218,7 +234,19 @@ auto_scaling.create_launch_configuration(
 print('Launch configuration created.')
 
 print('Creating Elastic Load Balancer..')
-subnets = ec2_east1_client.describe_subnets()
+def get_vpc():
+    vpcs = ec2_east1_client.describe_vpcs()
+    for i in vpcs['Vpcs']:
+        if(i['IsDefault']): return i['VpcId']
+
+vpc_info = get_vpc()
+subnets = ec2_east1_client.describe_subnets(Filters=[
+    {
+        'Name': 'vpc-id',
+        'Values': [vpc_info]
+    }
+])
+
 load_balancer = lb.create_load_balancer(
     Name='project-caio-elb',
     SecurityGroups=[webserver_sg['GroupId']],
@@ -228,13 +256,12 @@ load_balancer = lb.create_load_balancer(
 print('Elastic Load Balancer created.')
 
 print("Creating target group...")
-vpc_info = ec2_east1_client.describe_vpcs()
 target_group= lb.create_target_group(
     Name="project-caio-tg",
     Protocol='HTTP',
     TargetType='instance',
     Port=8080,
-    VpcId=vpc_info['Vpcs'][0]['VpcId'],
+    VpcId=vpc_info,
     HealthCheckProtocol='HTTP',
     HealthCheckEnabled=True,
     HealthCheckPath='/',
@@ -258,8 +285,6 @@ lb.create_listener(
         {
             'Type': 'forward',
             'TargetGroupArn': target_group['TargetGroups'][0]['TargetGroupArn'],
-
-
         }
     ]
 )
@@ -272,6 +297,7 @@ auto_scaling.create_auto_scaling_group(
     MinSize=1,
     MaxSize=5,
     DesiredCapacity=1,
+    DefaultCooldown=5,
     AvailabilityZones=['us-east-1a', 'us-east-1b', 'us-east-1c', 'us-east-1d', 'us-east-1e', 'us-east-1f'],
     Tags=[
         {
@@ -283,7 +309,6 @@ auto_scaling.create_auto_scaling_group(
 print("Auto Scaling group created.")
 
 print("Attaching load balancer to Auto Scaling Group...")
-
 auto_scaling.attach_load_balancer_target_groups(
     AutoScalingGroupName='project-caio-ASG',
     TargetGroupARNs=[target_group['TargetGroups'][0]['TargetGroupArn']]
@@ -292,7 +317,6 @@ auto_scaling.attach_load_balancer_target_groups(
 print("Load Balancer attached to Auto Scaling Group.")
 
 print("Adding scaling policy to Auto Scaling group...")
-
 load_balancer_id = load_balancer['LoadBalancers'][0]['LoadBalancerArn'].split("loadbalancer/")[1]
 target_group_id = target_group['TargetGroups'][0]['TargetGroupArn'].split(":")[5]
 scale_policy_label = (str(load_balancer_id) + "/" + str(target_group_id))
@@ -318,3 +342,6 @@ print("Waiting for Load Balancer to be ready. Please wait, could take up to 3 mi
 elb_waiter = lb.get_waiter('load_balancer_available')
 elb_waiter.wait(Names=['project-caio-elb'])
 print("Load Balancer public ip is " + str(load_balancer['LoadBalancers'][0]['DNSName']))
+
+with open("config.txt", "w") as url_file:
+    url_file.write("http://" + str(load_balancer['LoadBalancers'][0]['DNSName']))
